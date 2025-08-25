@@ -14,7 +14,7 @@ type DVBSEncoder struct {
 	rsEncoder      *RSEncoder
 	rsPacket       []byte
 	interleaverRAM []byte
-	prbsCounter    int // Add a counter to cycle through the PRBS LUT
+	prbsCounter    int
 }
 
 // NewDVBSEncoder creates a new encoder.
@@ -26,7 +26,7 @@ func NewDVBSEncoder() *DVBSEncoder {
 		rsEncoder:      rsEnc,
 		rsPacket:       make([]byte, consts.RSPacketSize),
 		interleaverRAM: interleaverRAM,
-		prbsCounter:    0, // Initialize the counter
+		prbsCounter:    0,
 	}
 }
 
@@ -36,12 +36,11 @@ func (e *DVBSEncoder) ReedSolomon(tsPacket []byte) {
 	copy(e.rsPacket, encodedPacket)
 }
 
-// Scramble performs energy dispersal on a 204-byte Reed-Solomon packet using the LUT.
+// Scramble performs energy dispersal on a 204-byte Reed-Solomon packet.
 func (e *DVBSEncoder) Scramble() {
-	// The sync byte of the original TS packet is inverted.
-	e.rsPacket[0] ^= 0xFF // 0x47 becomes 0xB8
+	e.rsPacket[0] ^= 0xFF // Invert sync byte
 
-	// The remaining 203 bytes are scrambled using the PRBS look-up table.
+	// Scramble the remaining 203 bytes using the PRBS LUT
 	for i := 1; i < consts.RSPacketSize; i++ {
 		e.rsPacket[i] ^= PrbsLUT[e.prbsCounter]
 		e.prbsCounter = (e.prbsCounter + 1) % len(PrbsLUT)
@@ -80,11 +79,16 @@ func (e *DVBSEncoder) ConvolutionalEncode() []byte {
 	out := make([]byte, 0, consts.RSPacketSize*8*2)
 	for i := 0; i < consts.RSPacketSize; i++ {
 		b := e.rsPacket[i]
-		for j := 0; j < 8; j++ {
+		for j := 0; j < 8; j++ { // LSB-first
 			bit := (b >> uint(j)) & 1
 			delay = ((delay << 1) | uint16(bit)) & 0x7F
 			b1 := utils.Parity(delay & g1)
 			b2 := utils.Parity(delay & g2)
+
+			// THE FINAL BUG FIX: According to the DVB-S standard for QPSK,
+			// the output of the second polynomial (G2) must be inverted.
+			b2 = b2 ^ 1
+
 			out = append(out, b1, b2)
 		}
 	}
