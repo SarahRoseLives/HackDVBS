@@ -10,20 +10,12 @@ type RSEncoder struct {
 
 // NewRSEncoder creates a new encoder for DVB-S.
 func NewRSEncoder() *RSEncoder {
-	// Generate the generator polynomial g(x) for T=8 (16 parity bytes)
-	// g(x) = (x-a^0)(x-a^1)...(x-a^15)
-	g := make([]byte, 17)
-	g[0] = 1 // g_0 is always 1
-
-	for i := 0; i < 16; i++ {
-		alpha_pow := gfExp[i]
-		for j := i + 1; j > 0; j-- {
-			// g[j] = g[j] * alpha_pow + g[j-1]
-			g[j] = gfMul(g[j], alpha_pow) ^ g[j-1]
-		}
+	// Use the exact hardcoded generator polynomial from the SDRangel source
+	// to ensure a perfect "bug-for-bug" compatible match.
+	generatorPoly := []byte{
+		59, 13, 104, 189, 68, 209, 30, 8, 163, 65, 41, 229, 98, 50, 36, 59,
 	}
-	// We only need the coefficients from g_1 to g_16 for the feedback implementation.
-	return &RSEncoder{generator: g[1:]}
+	return &RSEncoder{generator: generatorPoly}
 }
 
 // gfMul performs multiplication in the DVB-S specific GF(256) field.
@@ -35,34 +27,33 @@ func gfMul(a, b byte) byte {
 }
 
 // Encode takes a 188-byte data packet and returns a 204-byte packet with parity.
-// This function now implements a standard, correct systematic Reed-Solomon encoder.
+// **FIX**: This function now perfectly replicates the non-standard polynomial
+// division algorithm used in SDRangel's DVB-S transmitter.
 func (e *RSEncoder) Encode(data []byte) []byte {
 	if len(data) != 188 {
 		return nil // Or handle error appropriately
 	}
 
-	out := make([]byte, 204)
-	copy(out, data)
+	// Create a temporary buffer of 204 bytes to work in, mimicking the C++ implementation.
+	// The original C++ code uses a 239-byte buffer but only operates on the first 204 bytes.
+	tmp := make([]byte, 204)
+	copy(tmp, data) // Copy the 188 bytes of data, the rest is already zero.
 
-	// A 16-byte register for the parity calculation (remainder).
-	parityReg := make([]byte, 16)
-
-	// Process each data byte through the feedback shift register.
+	// This loop performs polynomial division to calculate the remainder (parity bytes).
 	for i := 0; i < 188; i++ {
-		feedback := data[i] ^ parityReg[0]
-		// Shift the register left by one byte.
-		copy(parityReg, parityReg[1:])
-		parityReg[15] = 0 // Last element is now 0
-
-		// If feedback is non-zero, XOR the register with the generator polynomial.
-		if feedback != 0 {
+		coef := tmp[i]
+		if coef != 0 {
 			for j := 0; j < 16; j++ {
-				parityReg[j] ^= gfMul(e.generator[j], feedback)
+				tmp[i+j+1] ^= gfMul(e.generator[j], coef)
 			}
 		}
 	}
 
-	// The register now holds the correct parity bytes.
-	copy(out[188:], parityReg)
+	// The last 16 bytes of tmp now contain the correct parity bytes.
+	// Append them to the original data to form the final 204-byte packet.
+	out := make([]byte, 204)
+	copy(out, data)
+	copy(out[188:], tmp[188:])
+
 	return out
 }

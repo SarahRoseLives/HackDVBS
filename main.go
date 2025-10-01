@@ -5,7 +5,7 @@ import (
 	"errors"
 	"flag"
 	"log"
-	"os/exec"
+	"os"
 
 	"github.com/samuel/go-hackrf/hackrf"
 	"hackdvbs/consts"
@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	// Create a buffer of 16 million samples, which is 2 seconds of data at 8 Msps.
+	// Create a buffer of 16 million samples, which is 2.10 seconds of data at 8 Msps.
 	numSamples = 16 * 1024 * 1024
 )
 
@@ -25,7 +25,7 @@ func main() {
 	flag.Parse()
 
 	// --- PHASE 1: PRE-COMPUTATION ---
-	log.Println("Starting signal pre-computation phase...")
+	log.Println("--- Preparing to transmit from test_stream.ts ---")
 
 	precomputedSamples := make([]complex128, numSamples)
 	iqChannel := make(chan complex128, 1024*1024)
@@ -33,43 +33,31 @@ func main() {
 	rrcFilter := filter.NewRRCFilter(consts.SymbolRate, consts.HackRFSampleRate, consts.RollOffFactor, consts.RRCFilterTaps)
 	dvbsEncoder := dvbs.NewDVBSEncoder()
 
-	// CORRECTED: Increased -muxrate to 2000k to provide more headroom and prevent packet drops.
-	ffmpegCmd := exec.Command("ffmpeg",
-		"-f", "lavfi", "-i", "testsrc=size=720x576:rate=25:decimals=2",
-		"-f", "lavfi", "-i", "anullsrc",
-		"-vcodec", "mpeg2video",
-		"-b:v", "1500k", "-maxrate", "1500k", "-bufsize", "3000k",
-		"-acodec", "mp2", "-b:a", "128k",
-		"-f", "mpegts",
-		"-muxrate", "2000k", // Reverted to 2000k for more overhead
-		"-max_delay", "500000",
-		"-pat_period", "0.1",
-		"-pcr_period", "20",
-		"-",
-	)
-
-	ffmpegStdout, _ := ffmpegCmd.StdoutPipe()
-	ffmpegStderr, _ := ffmpegCmd.StderrPipe()
-	if err := ffmpegCmd.Start(); err != nil {
-		log.Fatalf("Failed to start FFmpeg: %v", err)
+	// **REMOVED FFmpeg**: Open the local TS file directly.
+	tsFile, err := os.Open("test_stream.ts")
+	if err != nil {
+		log.Fatalf("Failed to open test_stream.ts: %v", err)
 	}
+	defer tsFile.Close()
 
-	go dvbs.StreamToIQ(ffmpegStdout, iqChannel, dvbsEncoder, rrcFilter)
-	go utils.LogFFmpeg(ffmpegStderr)
+	// Start the DVB-S encoding process, reading from the file.
+	go dvbs.StreamToIQ(tsFile, iqChannel, dvbsEncoder, rrcFilter)
 
 	log.Printf("Generating %d I/Q samples (%.2f seconds of signal)...", numSamples, float64(numSamples)/consts.HackRFSampleRate)
 	for i := 0; i < numSamples; i++ {
 		sample, ok := <-iqChannel
 		if !ok {
-			log.Fatalf("IQ channel closed before buffer was full. FFmpeg may have exited prematurely.")
+			// This is now expected if test_stream.ts is shorter than the buffer size.
+			log.Println("Finished reading test_stream.ts. The pre-computed buffer might not be full.")
+			// Fill the rest of the buffer with silence (zeros)
+			for j := i; j < numSamples; j++ {
+				precomputedSamples[j] = complex(0, 0)
+			}
+			break // Exit the loop
 		}
 		precomputedSamples[i] = sample
 	}
 	log.Println("Sample generation complete.")
-
-	if err := ffmpegCmd.Process.Kill(); err != nil {
-		log.Printf("Failed to kill FFmpeg process: %v", err)
-	}
 
 	// --- PHASE 2: TRANSMISSION ---
 	log.Println("Starting transmission phase...")

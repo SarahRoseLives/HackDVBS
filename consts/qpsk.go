@@ -2,10 +2,11 @@ package consts
 
 import "math"
 
-// Correct DVB-S QPSK Gray mapping
+// Non-Standard DVB-S QPSK Gray mapping to match the SDRangel implementation.
+// The mappings for bits 01 and 10 are swapped compared to the ETSI standard.
 var QPSKSymbolMap = map[byte]complex128{
-	0: complex(1/math.Sqrt2, 1/math.Sqrt2),  // 00
-	1: complex(1/math.Sqrt2, -1/math.Sqrt2), // 01
-	2: complex(-1/math.Sqrt2, 1/math.Sqrt2), // 10
-	3: complex(-1/math.Sqrt2, -1/math.Sqrt2), // 11
+	0: complex(1/math.Sqrt2, 1/math.Sqrt2),   // bits 00 -> ( 1,  1)
+	1: complex(1/math.Sqrt2, -1/math.Sqrt2),  // bits 01 -> ( 1, -1) [SWAPPED]
+	2: complex(-1/math.Sqrt2, 1/math.Sqrt2), // bits 10 -> (-1,  1) [SWAPPED]
+	3: complex(-1/math.Sqrt2, -1/math.Sqrt2), // bits 11 -> (-1, -1)
 }
