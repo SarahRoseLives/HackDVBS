@@ -21,21 +21,27 @@ const (
 )
 
 func main() {
-    freq := flag.Float64("freq", 1280.0, "Transmit frequency in MHz")
+    freq := flag.Float64("freq", 1250.0, "Transmit frequency in MHz")
     gain := flag.Int("gain", 30, "TX VGA gain (0-47)")
     device := flag.String("device", "/dev/video0", "Video device (Linux) or device index (e.g., '0' for Windows/Mac)")
     videoSize := flag.String("size", "640x480", "Video resolution (e.g., 640x480, 1280x720)")
     videoBitrate := flag.String("vbitrate", "1M", "Video bitrate (e.g., 500k, 1M, 2M)")
     audioBitrate := flag.String("abitrate", "128k", "Audio bitrate (e.g., 64k, 128k)")
     fps := flag.Int("fps", 25, "Frames per second")
+    colorBars := flag.Bool("colorbars", false, "Use SMPTE color bars instead of webcam")
     flag.Parse()
 
     log.Println("--- Starting DVB-S Webcam Transmitter ---")
     log.Printf("Frequency: %.2f MHz, Gain: %d dB", *freq, *gain)
     log.Printf("Video: %s @ %d fps, bitrate: %s", *videoSize, *fps, *videoBitrate)
+    if *colorBars {
+        log.Println("Source: SMPTE Color Bars (test pattern)")
+    } else {
+        log.Printf("Source: Webcam (%s)", *device)
+    }
 
     // Start FFmpeg to capture webcam and encode to MPEG-TS
-    ffmpegCmd := buildFFmpegCommand(*device, *videoSize, *fps, *videoBitrate, *audioBitrate)
+    ffmpegCmd := buildFFmpegCommand(*device, *videoSize, *fps, *videoBitrate, *audioBitrate, *colorBars)
 
     ffmpegStdout, err := ffmpegCmd.StdoutPipe()
     if err != nil {
@@ -147,44 +153,42 @@ func main() {
     log.Println("Transmission stopped.")
 }
 
-func buildFFmpegCommand(device, videoSize string, fps int, videoBitrate, audioBitrate string) *exec.Cmd {
-    // Detect platform and build appropriate FFmpeg command
+func buildFFmpegCommand(device, videoSize string, fps int, videoBitrate, audioBitrate string, colorBars bool) *exec.Cmd {
     var args []string
 
-    // Check if device looks like a path (Linux) or index (Windows/Mac)
-    if len(device) > 0 && device[0] == '/' {
-        // Linux - use v4l2
+    if colorBars {
+        // Use test pattern (SMPTE color bars)
         args = []string{
+            "-f", "lavfi",
+            "-i", "smptebars=size=" + videoSize + ":rate=" + strconv.Itoa(fps),
+            "-f", "lavfi",
+            "-i", "sine=frequency=1000:sample_rate=48000",
+        }
+    } else {
+        // Use webcam with MJPEG for speed, larger thread queue to prevent blocking
+        args = []string{
+            "-thread_queue_size", "512",
             "-f", "v4l2",
             "-input_format", "mjpeg",
             "-video_size", videoSize,
             "-framerate", strconv.Itoa(fps),
             "-i", device,
-            "-f", "alsa",
-            "-i", "default",
-        }
-    } else {
-        // Windows/Mac - try different input formats
-        // For Windows: use dshow
-        // For Mac: use avfoundation
-        // This is a simplified version - you may need to adjust based on your OS
-        args = []string{
-            "-f", "v4l2", // Change to "dshow" for Windows or "avfoundation" for Mac
-            "-video_size", videoSize,
-            "-framerate", strconv.Itoa(fps),
-            "-i", device,
-            "-f", "alsa", // Change to "dshow" for Windows or "avfoundation" for Mac
-            "-i", "default",
+            "-f", "lavfi",
+            "-i", "sine=frequency=1000:sample_rate=48000",
         }
     }
 
-    // Common encoding parameters
+    // Encoding parameters - larger buffer to prevent underflow
     args = append(args,
         "-c:v", "mpeg2video",
         "-b:v", videoBitrate,
         "-maxrate", videoBitrate,
-        "-bufsize", "2M",
-        "-g", "25", // GOP size
+        "-minrate", videoBitrate,
+        "-bufsize", "2M", // Larger buffer prevents underflow
+        "-g", "12",
+        "-bf", "0",
+        "-qmin", "1",
+        "-qmax", "31",
         "-c:a", "mp2",
         "-b:a", audioBitrate,
         "-ar", "48000",
