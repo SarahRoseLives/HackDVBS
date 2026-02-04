@@ -88,9 +88,7 @@ func (e *DVBSEncoder) Interleave(rsPacket []byte) []byte {
 			if p < consts.RSPacketSize {
 				fifo := e.interleaverFIFOs[i]
 				idx := e.interleaverIndices[i]
-				tmp := fifo[idx]
-				fifo[idx] = out[p]
-				out[p] = tmp
+				out[p], fifo[idx] = fifo[idx], out[p]
 				e.interleaverIndices[i] = (idx + 1) % len(fifo)
 				p++
 			}
@@ -106,16 +104,19 @@ func (e *DVBSEncoder) ConvolutionalEncode(interleavedPacket []byte) []byte {
 	const g1 = 0x4F // Reversed 0x79
 	const g2 = 0x6D // Reversed 0x5B
 
+	// Pre-allocate exact size needed
+	out := make([]byte, consts.RSPacketSize*8*2)
+	outIdx := 0
 	delay := uint16(0)
-	out := make([]byte, 0, consts.RSPacketSize*8*2)
+	
 	for i := 0; i < consts.RSPacketSize; i++ {
 		b := interleavedPacket[i]
 		for j := 7; j >= 0; j-- {
 			bit := (b >> uint(j)) & 1
-			delay = ((delay << 1) | uint16(bit)) & 0x7F // This left-shift is correct
-			b1 := utils.Parity(delay & g1)
-			b2 := utils.Parity(delay & g2)
-			out = append(out, b1, b2)
+			delay = ((delay << 1) | uint16(bit)) & 0x7F
+			out[outIdx] = utils.Parity(delay & g1)
+			out[outIdx+1] = utils.Parity(delay & g2)
+			outIdx += 2
 		}
 	}
 	return out
@@ -137,10 +138,14 @@ func (e *DVBSEncoder) EncodePacket(tsPacket []byte) []byte {
 }
 
 // StreamToIQ processes the TS stream and generates I/Q samples.
-func StreamToIQ(tsReader io.Reader, iqBuffer chan complex128, dvbsEncoder *DVBSEncoder, rrcFilter *filter.FIRFilter) {
+func StreamToIQ(tsReader io.Reader, iqBuffer chan complex64, dvbsEncoder *DVBSEncoder, rrcFilter *filter.FIRFilter) {
 	defer close(iqBuffer)
-	tsPacket := make([]byte, consts.TSPacketSize)
 
+	// Pre-allocate buffers to avoid GC pressure
+	tsPacket := make([]byte, consts.TSPacketSize)
+	maxSymbolsPerPacket := 2048
+	qpskSymbols := make([]complex64, maxSymbolsPerPacket)
+	
 	for {
 		_, err := io.ReadFull(tsReader, tsPacket)
 		if err != nil {
@@ -153,15 +158,19 @@ func StreamToIQ(tsReader io.Reader, iqBuffer chan complex128, dvbsEncoder *DVBSE
 			log.Println("Warning: Lost TS packet sync.")
 			continue
 		}
+		
 		encodedBits := dvbsEncoder.EncodePacket(tsPacket)
-		qpskSymbols := make([]complex128, len(encodedBits)/2)
-		for i := 0; i < len(encodedBits); i += 2 {
-			sym := (encodedBits[i] << 1) | encodedBits[i+1]
-			qpskSymbols[i/2] = consts.QPSKSymbolMap[sym]
+		symbolCount := len(encodedBits) / 2
+		
+		// Use fast QPSK lookup array
+		for i := 0; i < symbolCount; i++ {
+			sym := (encodedBits[i*2] << 1) | encodedBits[i*2+1]
+			qpskSymbols[i] = consts.QPSKFast[sym]
 		}
-		iqSamples := rrcFilter.Process(qpskSymbols)
-
-		// Pass samples directly to the buffer without any DC blocking.
+		
+		iqSamples := rrcFilter.Process(qpskSymbols[:symbolCount])
+		
+		// Write samples
 		for _, sample := range iqSamples {
 			iqBuffer <- sample
 		}

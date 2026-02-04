@@ -10,3 +10,11 @@ var QPSKSymbolMap = map[byte]complex128{
 	2: complex(-1/math.Sqrt2, 1/math.Sqrt2), // bits 10 -> (-1,  1) [SWAPPED]
 	3: complex(-1/math.Sqrt2, -1/math.Sqrt2), // bits 11 -> (-1, -1)
 }
+
+// Fast QPSK lookup - array is faster than map
+var QPSKFast = [4]complex64{
+	complex64(complex(1/math.Sqrt2, 1/math.Sqrt2)),
+	complex64(complex(1/math.Sqrt2, -1/math.Sqrt2)),
+	complex64(complex(-1/math.Sqrt2, 1/math.Sqrt2)),
+	complex64(complex(-1/math.Sqrt2, -1/math.Sqrt2)),
+}

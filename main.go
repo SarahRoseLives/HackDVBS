@@ -7,6 +7,7 @@ import (
     "log"
     "os/exec"
     "strconv"
+    "time"
 
     "github.com/samuel/go-hackrf/hackrf"
     "hackdvbs/consts"
@@ -16,8 +17,8 @@ import (
 )
 
 const (
-    // Buffer size for streaming mode - smaller buffer for lower latency
-    streamBufferSize = 2 * 1024 * 1024 // 0.25 seconds at 8 Msps
+    // Buffer size for streaming mode - back to 2Msps
+    streamBufferSize = 8 * 1024 * 1024 // ~4 seconds at 2 Msps
 )
 
 func main() {
@@ -25,23 +26,31 @@ func main() {
     gain := flag.Int("gain", 30, "TX VGA gain (0-47)")
     device := flag.String("device", "/dev/video0", "Video device (Linux) or device index (e.g., '0' for Windows/Mac)")
     videoSize := flag.String("size", "640x480", "Video resolution (e.g., 640x480, 1280x720)")
-    videoBitrate := flag.String("vbitrate", "1M", "Video bitrate (e.g., 500k, 1M, 2M)")
+    videoBitrate := flag.String("vbitrate", "1500k", "Video bitrate (e.g., 500k, 1M, 1500k)")
     audioBitrate := flag.String("abitrate", "128k", "Audio bitrate (e.g., 64k, 128k)")
     fps := flag.Int("fps", 25, "Frames per second")
     colorBars := flag.Bool("colorbars", false, "Use SMPTE color bars instead of webcam")
+    inputFile := flag.String("file", "", "Transmit a pre-recorded .ts file instead of live source")
     flag.Parse()
 
     log.Println("--- Starting DVB-S Webcam Transmitter ---")
     log.Printf("Frequency: %.2f MHz, Gain: %d dB", *freq, *gain)
-    log.Printf("Video: %s @ %d fps, bitrate: %s", *videoSize, *fps, *videoBitrate)
-    if *colorBars {
+
+    var ffmpegCmd *exec.Cmd
+    if *inputFile != "" {
+        log.Printf("Source: File (%s)", *inputFile)
+        ffmpegCmd = buildFileCommand(*inputFile)
+    } else if *colorBars {
+        log.Printf("Video: %s @ %d fps, bitrate: %s", *videoSize, *fps, *videoBitrate)
         log.Println("Source: SMPTE Color Bars (test pattern)")
+        ffmpegCmd = buildFFmpegCommand(*device, *videoSize, *fps, *videoBitrate, *audioBitrate, true)
     } else {
+        log.Printf("Video: %s @ %d fps, bitrate: %s", *videoSize, *fps, *videoBitrate)
         log.Printf("Source: Webcam (%s)", *device)
+        ffmpegCmd = buildFFmpegCommand(*device, *videoSize, *fps, *videoBitrate, *audioBitrate, false)
     }
 
     // Start FFmpeg to capture webcam and encode to MPEG-TS
-    ffmpegCmd := buildFFmpegCommand(*device, *videoSize, *fps, *videoBitrate, *audioBitrate, *colorBars)
 
     ffmpegStdout, err := ffmpegCmd.StdoutPipe()
     if err != nil {
@@ -76,21 +85,35 @@ func main() {
     dev.SetFreq(uint64(*freq * 1_000_000))
     dev.SetSampleRate(consts.HackRFSampleRate)
     dev.SetTXVGAGain(*gain)
-    dev.SetAmpEnable(true)
+    dev.SetAmpEnable(true)  // Re-enable amp
+    dev.SetBasebandFilterBandwidth(1750000)
 
     // Create DVB-S encoder and filter
     rrcFilter := filter.NewRRCFilter(consts.SymbolRate, consts.HackRFSampleRate, consts.RollOffFactor, consts.RRCFilterTaps)
     dvbsEncoder := dvbs.NewDVBSEncoder()
 
-    // Create I/Q sample buffer and channel
-    iqChannel := make(chan complex128, 512*1024)
-    sampleBuffer := make([]complex128, streamBufferSize)
+    // Create I/Q sample buffer and channel - use complex64 for speed
+    iqChannel := make(chan complex64, 2*1024*1024)
+    sampleBuffer := make([]complex64, streamBufferSize)
     bufferReadPos := 0
     bufferWritePos := 0
 
     // Start the DVB-S encoding goroutine
     go dvbs.StreamToIQ(ffmpegStdout, iqChannel, dvbsEncoder, rrcFilter)
 
+    // Wait for channel to fill substantially before buffering
+    log.Println("Waiting for encoder to build up data...")
+    targetChannelFill := 1500000 // ~0.75 seconds at 2Msps
+    for {
+        channelSize := len(iqChannel)
+        if channelSize >= targetChannelFill {
+            log.Printf("Channel ready with %d samples", channelSize)
+            break
+        }
+        log.Printf("Channel filling... %d / %d samples (%.1f%%)", channelSize, targetChannelFill, float64(channelSize)*100/float64(targetChannelFill))
+        time.Sleep(1 * time.Second)
+    }
+    
     // Pre-fill buffer
     log.Println("Pre-filling buffer...")
     for i := 0; i < streamBufferSize; i++ {
@@ -101,7 +124,23 @@ func main() {
         sampleBuffer[i] = sample
     }
     bufferWritePos = 0
-    log.Println("Buffer filled, starting transmission...")
+    
+    // Final check - channel should still have plenty
+    channelFill := len(iqChannel)
+    log.Printf("Buffer filled (%d samples = %.2f seconds), channel has %d samples ready", 
+        streamBufferSize, float64(streamBufferSize)/float64(consts.HackRFSampleRate), channelFill)
+    
+    // Don't start until we have reserve
+    for channelFill < 200000 {
+        log.Printf("Waiting for reserve... channel at %d samples", channelFill)
+        time.Sleep(2 * time.Second)
+        channelFill = len(iqChannel)
+    }
+    
+    log.Println("Starting transmission...")
+
+    // Track buffer health
+    var bufferUnderflows uint64
 
     // Background goroutine to continuously fill the buffer
     go func() {
@@ -109,13 +148,28 @@ func main() {
             sampleBuffer[bufferWritePos] = sample
             bufferWritePos = (bufferWritePos + 1) % streamBufferSize
         }
+        log.Println("Warning: IQ channel closed, no more samples!")
+    }()
+
+    // Buffer health monitoring
+    go func() {
+        ticker := time.NewTicker(5 * time.Second)
+        defer ticker.Stop()
+        for range ticker.C {
+            available := (bufferWritePos - bufferReadPos + streamBufferSize) % streamBufferSize
+            fillPct := float64(available) * 100.0 / float64(streamBufferSize)
+            log.Printf("Buffer: %.1f%% full (%d samples), underflows: %d", fillPct, available, bufferUnderflows)
+            if fillPct < 10 {
+                log.Printf("WARNING: Buffer critically low!")
+            }
+        }
     }()
 
     // Start transmission
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
-    const digitalGain = 110.0
+    const digitalGain = 100.0  // Compromise between clipping and power
 
     err = dev.StartTX(func(buf []byte) error {
         select {
@@ -126,6 +180,18 @@ func main() {
 
         samplesToWrite := len(buf) / 2
         for i := 0; i < samplesToWrite; i++ {
+            // Check if we're about to overtake the write position
+            if bufferReadPos == bufferWritePos {
+                bufferUnderflows++
+                // Hold last sample on underflow instead of wrapping
+                sample := sampleBuffer[(bufferReadPos-1+streamBufferSize)%streamBufferSize]
+                i_sample := int8(real(sample) * digitalGain)
+                q_sample := int8(imag(sample) * digitalGain)
+                buf[i*2] = byte(i_sample)
+                buf[i*2+1] = byte(q_sample)
+                continue
+            }
+            
             sample := sampleBuffer[bufferReadPos]
             i_sample := int8(real(sample) * digitalGain)
             q_sample := int8(imag(sample) * digitalGain)
@@ -154,49 +220,65 @@ func main() {
 }
 
 func buildFFmpegCommand(device, videoSize string, fps int, videoBitrate, audioBitrate string, colorBars bool) *exec.Cmd {
-    var args []string
-
     if colorBars {
         // Use test pattern (SMPTE color bars)
-        args = []string{
+        args := []string{
             "-f", "lavfi",
             "-i", "smptebars=size=" + videoSize + ":rate=" + strconv.Itoa(fps),
             "-f", "lavfi",
             "-i", "sine=frequency=1000:sample_rate=48000",
+            "-c:v", "mpeg2video",
+            "-pix_fmt", "yuv420p",
+            "-b:v", videoBitrate,
+            "-maxrate", videoBitrate,
+            "-bufsize", "3M",
+            "-g", "12",
+            "-bf", "0",
+            "-c:a", "mp2",
+            "-b:a", audioBitrate,
+            "-ar", "44100",
+            "-f", "mpegts",
+            "-muxrate", "2M",
+            "-",
         }
-    } else {
-        // Use webcam with MJPEG for speed, larger thread queue to prevent blocking
-        args = []string{
-            "-thread_queue_size", "512",
-            "-f", "v4l2",
-            "-input_format", "mjpeg",
-            "-video_size", videoSize,
-            "-framerate", strconv.Itoa(fps),
-            "-i", device,
-            "-f", "lavfi",
-            "-i", "sine=frequency=1000:sample_rate=48000",
-        }
+        return exec.Command("ffmpeg", args...)
     }
 
-    // Encoding parameters - larger buffer to prevent underflow
-    args = append(args,
+    // Webcam: Settings matching working leandvbtx pipeline
+    args := []string{
+        "-thread_queue_size", "512",
+        "-f", "v4l2",
+        "-video_size", videoSize,
+        "-framerate", strconv.Itoa(fps),
+        "-i", device,
+        "-thread_queue_size", "512",
+        "-f", "alsa",
+        "-i", "default",
         "-c:v", "mpeg2video",
+        "-pix_fmt", "yuv420p",
         "-b:v", videoBitrate,
         "-maxrate", videoBitrate,
-        "-minrate", videoBitrate,
-        "-bufsize", "2M", // Larger buffer prevents underflow
+        "-bufsize", "3M",
         "-g", "12",
         "-bf", "0",
-        "-qmin", "1",
-        "-qmax", "31",
         "-c:a", "mp2",
         "-b:a", audioBitrate,
-        "-ar", "48000",
-        "-ac", "2",
+        "-ar", "44100",
         "-f", "mpegts",
         "-muxrate", "2M",
         "-",
-    )
+    }
+    return exec.Command("ffmpeg", args...)
+}
 
+func buildFileCommand(filename string) *exec.Cmd {
+    // Stream pre-recorded .ts file - no rate limiting, let buffer handle it
+    args := []string{
+        "-stream_loop", "-1", // Loop forever
+        "-i", filename,
+        "-c", "copy", // No re-encoding
+        "-f", "mpegts",
+        "-",
+    }
     return exec.Command("ffmpeg", args...)
 }
