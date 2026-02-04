@@ -26,9 +26,9 @@ func main() {
     gain := flag.Int("gain", 30, "TX VGA gain (0-47)")
     device := flag.String("device", "/dev/video0", "Video device (Linux) or device index (e.g., '0' for Windows/Mac)")
     videoSize := flag.String("size", "640x480", "Video resolution (e.g., 640x480, 1280x720)")
-    videoBitrate := flag.String("vbitrate", "1500k", "Video bitrate (e.g., 500k, 1M, 1500k)")
+    videoBitrate := flag.String("vbitrate", "700k", "Video bitrate (e.g., 500k, 700k, 1M)")
     audioBitrate := flag.String("abitrate", "128k", "Audio bitrate (e.g., 64k, 128k)")
-    fps := flag.Int("fps", 25, "Frames per second")
+    fps := flag.Int("fps", 30, "Frames per second")
     colorBars := flag.Bool("colorbars", false, "Use SMPTE color bars instead of webcam")
     inputFile := flag.String("file", "", "Transmit a pre-recorded .ts file instead of live source")
     flag.Parse()
@@ -231,14 +231,15 @@ func buildFFmpegCommand(device, videoSize string, fps int, videoBitrate, audioBi
             "-pix_fmt", "yuv420p",
             "-b:v", videoBitrate,
             "-maxrate", videoBitrate,
-            "-bufsize", "3M",
-            "-g", "12",
+            "-bufsize", "1400k",
+            "-g", "10",
             "-bf", "0",
             "-c:a", "mp2",
             "-b:a", audioBitrate,
             "-ar", "44100",
             "-f", "mpegts",
-            "-muxrate", "2M",
+            "-muxrate", "1M",
+            "-pcr_period", "20",
             "-",
         }
         return exec.Command("ffmpeg", args...)
@@ -254,18 +255,20 @@ func buildFFmpegCommand(device, videoSize string, fps int, videoBitrate, audioBi
         "-thread_queue_size", "512",
         "-f", "alsa",
         "-i", "default",
+        "-r", strconv.Itoa(fps), // Force output framerate
         "-c:v", "mpeg2video",
         "-pix_fmt", "yuv420p",
         "-b:v", videoBitrate,
         "-maxrate", videoBitrate,
-        "-bufsize", "3M",
-        "-g", "12",
+        "-bufsize", "1400k",
+        "-g", "10",
         "-bf", "0",
         "-c:a", "mp2",
         "-b:a", audioBitrate,
         "-ar", "44100",
         "-f", "mpegts",
-        "-muxrate", "2M",
+        "-muxrate", "1M",
+        "-pcr_period", "20",
         "-",
     }
     return exec.Command("ffmpeg", args...)
